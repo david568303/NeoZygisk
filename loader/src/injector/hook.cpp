@@ -102,6 +102,66 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
 // Skip actual fork and return cached result if applicable
 DCL_HOOK_FUNC(int, fork) { return (g_ctx && g_ctx->pid >= 0) ? g_ctx->pid : old_fork(); }
 
+// ---------------------------------------------------------------------------
+// GrapheneOS exec-spawn support (opt-in, Stage 1: detection/observability only)
+// ---------------------------------------------------------------------------
+//
+// On GrapheneOS "secure app spawning", the primary zygote launches apps with
+// Zygote.nativeForkExec(): the child _Fork()s and immediately re-execs
+// app_process (execveat on arm64, execve as fallback), replaying the recorded
+// zygote command. Because the child execs, it loses the injected Zygisk loader,
+// so modules never reach exec-spawned apps.
+//
+// The exec happens inside the child while it is still a plain fork of the
+// injected zygote -- meaning this PLT hook (installed in the zygote, inherited
+// across _Fork) runs in the child, right before the exec. The replayed command
+// always carries ExecSpawning.COMMAND_FD_ARG ("--command-fd="), which uniquely
+// identifies an exec-spawn launch and never matches system_server or regular
+// forkAndSpecialize children (those do not exec).
+//
+// Stage 1 only observes and logs. Stage 2 will, at this point, deterministically
+// hand the child off for injection (self-SIGSTOP so it cannot exec until a root
+// tracer has seized it with PTRACE_O_TRACEEXEC). Gated by an opt-in flag read
+// once at hook_entry, so default builds are unaffected.
+
+static bool g_exec_spawn_enabled = false;
+
+static bool exec_is_app_process(const char *path) {
+    if (!path) return false;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "app_process", 11) == 0;
+}
+
+static bool exec_has_command_fd(char *const argv[]) {
+    if (!argv) return false;
+    for (int i = 0; argv[i] != nullptr && i < 256; i++) {
+        if (strncmp(argv[i], "--command-fd=", 13) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_exec_spawn(const char *path, char *const argv[]) {
+    return g_exec_spawn_enabled && exec_is_app_process(path) && exec_has_command_fd(argv);
+}
+
+DCL_HOOK_FUNC(static int, execve, const char *path, char *const argv[], char *const envp[]) {
+    if (is_exec_spawn(path, argv)) {
+        LOGI("exec-spawn: detected app launch pid=%d via execve (%s)", getpid(), path);
+        // Stage 2: deterministic sync + handoff to the injector happens here.
+    }
+    return old_execve(path, argv, envp);
+}
+
+DCL_HOOK_FUNC(static int, execveat, int dirfd, const char *path, char *const argv[],
+              char *const envp[], int flags) {
+    if (is_exec_spawn(path, argv)) {
+        LOGI("exec-spawn: detected app launch pid=%d via execveat (%s)", getpid(), path);
+        // Stage 2: deterministic sync + handoff to the injector happens here.
+    }
+    return old_execveat(dirfd, path, argv, envp, flags);
+}
+
 // Unmount stuffs in the process's private mount namespace
 DCL_HOOK_FUNC(static int, unshare, int flags) {
     if (g_ctx && (flags & CLONE_NEWNS) && !(g_ctx->flags & SERVER_FORK_AND_SPECIALIZE)) {
@@ -267,6 +327,12 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
+    if (g_exec_spawn_enabled) {
+        // GrapheneOS exec-spawn: catch the child's re-exec of app_process. execveat is the
+        // primary path on arm64; execve is the fallback. Only registered when opted in.
+        PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, execve);
+        PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, execveat);
+    }
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 
@@ -426,6 +492,17 @@ void HookContext::restore_zygote_hook(JNIEnv *env) {
 
 void hook_entry(void *start_addr, size_t block_size) {
     g_hook = new HookContext(start_addr, block_size);
+
+    // GrapheneOS exec-spawn support is opt-in: enabled only when a flag file exists in the
+    // daemon work directory. Read once here (in the zygote); the result is inherited by every
+    // forked child, so default builds install no exec hooks and behave exactly like stock.
+    {
+        std::string flag_path = std::string(zygiskd::GetTmpPath()) + "/exec_spawn_inject";
+        g_exec_spawn_enabled = access(flag_path.c_str(), F_OK) == 0;
+        LOGI("exec-spawn: injection %s", g_exec_spawn_enabled ? "ENABLED (flag present)"
+                                                              : "disabled (no flag)");
+    }
+
     g_hook->hook_plt();
 
     uintptr_t reserved_base = 0;
