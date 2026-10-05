@@ -67,8 +67,8 @@ bool ZygoteAbiManager::ensure_daemon_created() {
     return status_.daemon_running;
 }
 
-const char* ZygoteAbiManager::check_and_prepare_injection() {
-    if (is_in_crash_loop()) {
+const char* ZygoteAbiManager::check_and_prepare_injection(bool skip_crash_check) {
+    if (!skip_crash_check && is_in_crash_loop()) {
         monitor_.request_stop("zygote crashed");
         return nullptr;
     }

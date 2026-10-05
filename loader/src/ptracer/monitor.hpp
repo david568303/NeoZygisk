@@ -118,6 +118,9 @@ public:
     void request_stop(std::string reason);
     void request_exit();
     void notify_init_detached();
+    // GrapheneOS exec-spawning support (experimental, opt-in via a flag file). Begins following the
+    // primary zygote's exec-spawned children once it has been injected; a no-op otherwise.
+    void follow_primary_zygote_if_enabled();
 
     // Public Accessors for owned components
     ZygoteAbiManager &get_abi_manager();
@@ -151,6 +154,10 @@ private:
         void HandleEvent(EventLoop &, uint32_t) override;
         ~SigChldHandler() override;
 
+        // Re-seize the already-injected primary zygote with TRACEFORK so its exec-spawned
+        // children are caught and injected too (GrapheneOS secure app spawning).
+        void start_following_exec_spawn();
+
     private:
         void handleChildEvent(int pid, int &status);
         void handleParentEvent(int pid, int &status);
@@ -165,6 +172,11 @@ private:
         int status_ = 0;
         std::set<pid_t> process_;
         std::set<pid_t> stub_processes_;
+
+        // GrapheneOS exec-spawning: the first (persistent) zygote, and whether we are following
+        // its exec-spawned children.
+        pid_t primary_zygote_pid_ = -1;
+        bool following_exec_spawn_ = false;
     };
 
     void set_tracing_state(TracingState state);

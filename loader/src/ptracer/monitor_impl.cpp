@@ -175,6 +175,14 @@ void AppMonitor::notify_init_detached() {
     LOGI("stop tracing init");
 }
 
+void AppMonitor::follow_primary_zygote_if_enabled() {
+    // Experimental GrapheneOS secure-app-spawning support. Disabled unless an opt-in flag file
+    // ("exec_spawn_inject") exists in the module directory (the monitor's working directory), so
+    // default builds behave exactly like stock NeoZygisk and this path is never armed.
+    if (access("./exec_spawn_inject", F_OK) != 0) return;
+    ptrace_handler_.start_following_exec_spawn();
+}
+
 // --- SocketHandler Method Implementations ---
 
 int AppMonitor::SocketHandler::GetFd() { return sock_fd_; }
@@ -255,6 +263,9 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
         case ZYGOTE_INJECTED:
             monitor_.get_abi_manager().notify_injected();
             monitor_.update_status();
+            // Opt-in: once the primary zygote is injected, start following its exec-spawned
+            // children so they are injected too (GrapheneOS secure app spawning).
+            monitor_.follow_primary_zygote_if_enabled();
             break;
         case DAEMON_SET_INFO:
             monitor_.get_abi_manager().set_daemon_info({full_msg.data, (size_t) full_msg.length});
@@ -423,6 +434,12 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
     else if (pid != 1 && (WIFEXITED(status) || WIFSIGNALED(status))) {
         LOGI("stub process %d exited (status: %d)", pid, status);
         stub_processes_.erase(pid);
+        // If the primary zygote itself restarted, allow re-following the replacement.
+        if (pid == primary_zygote_pid_) {
+            primary_zygote_pid_ = -1;
+            following_exec_spawn_ = false;
+            LOGI("primary zygote %d exited; will re-follow after reinjection", pid);
+        }
         return;
     }
 
@@ -462,6 +479,27 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
 /**
  * @brief Registers and prepares a newly discovered process for execve tracking.
  */
+void AppMonitor::SigChldHandler::start_following_exec_spawn() {
+    if (following_exec_spawn_ || primary_zygote_pid_ <= 0) return;
+
+    // The external injector has injected and detached from the primary zygote by the time
+    // ZYGOTE_INJECTED arrives, so re-seizing it here does not conflict with it. TRACEFORK makes the
+    // kernel auto-trace its fork+exec children -- the ephemeral zygotes GrapheneOS creates via
+    // ZygoteConnection.nativeForkExec -- which then flow through the existing
+    // handleNewProcess -> handleTracedProcess -> handleExecEvent pipeline and get injected exactly
+    // like the primary. Adding it to stub_processes_ reuses the "process factory" role, which also
+    // shields it from the SIGCHLD its traced children generate (see handleParentEvent). Seizing a
+    // running process does not stop it, so app spawning is not paused.
+    if (ptrace(PTRACE_SEIZE, primary_zygote_pid_, 0, PTRACE_O_TRACEFORK) == -1) {
+        PLOGE("exec-spawn: failed to re-seize primary zygote %d", primary_zygote_pid_);
+        return;
+    }
+    stub_processes_.insert(primary_zygote_pid_);
+    following_exec_spawn_ = true;
+    LOGI("exec-spawn: now following primary zygote %d for exec-spawned children",
+         primary_zygote_pid_);
+}
+
 void AppMonitor::SigChldHandler::handleNewProcess(int pid) {
     LOGV("new process %d discovered and attached", pid);
     process_.emplace(pid);
@@ -562,11 +600,21 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             break;  // Irrelevant program, exit block and return false.
         }
 
-        const char *tracer = monitor_.get_abi_manager().check_and_prepare_injection();
+        // When following GrapheneOS exec-spawning, every app launch produces a fresh ephemeral
+        // zygote that also execs program_path_. Those must skip crash-loop detection (one injection
+        // per launch would otherwise false-trip the counter and stop the monitor). The persistent
+        // primary zygote, and the normal non-following case, keep the full check.
+        bool ephemeral = following_exec_spawn_ && primary_zygote_pid_ != -1 &&
+                         pid != primary_zygote_pid_;
+        const char *tracer = monitor_.get_abi_manager().check_and_prepare_injection(ephemeral);
         if (tracer == nullptr) {
             LOGE("failed to prepare injector for target %d", pid);
             break;
         }
+
+        // Remember the first (persistent) zygote so later exec-spawned ones are recognised as
+        // ephemeral. Recorded before the hand-off detach below.
+        if (primary_zygote_pid_ == -1) primary_zygote_pid_ = pid;
 
         // --- Zygote Handover Sequence ---
         LOGV("intercepted target zygote %d, halting for injector hand-off", pid);

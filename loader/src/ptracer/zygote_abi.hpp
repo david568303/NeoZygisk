@@ -26,7 +26,9 @@ public:
 
     // Public Interface for event handling
     bool handle_daemon_exit_if_match(int pid, int process_status);
-    const char* check_and_prepare_injection();
+    // skip_crash_check is used for GrapheneOS exec-spawned ephemeral zygotes: there is one per app
+    // launch, so the normal crash-loop counter (injections per time window) would false-trip.
+    const char* check_and_prepare_injection(bool skip_crash_check = false);
 
     // Public methods for state modification
     const Status& get_status() const;
